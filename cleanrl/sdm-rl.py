@@ -68,6 +68,49 @@ def parse_args():
         help="timestep to start learning")
     parser.add_argument("--train-frequency", type=int, default=10,
         help="the frequency of training")
+    
+    # Flags specific to SDM-RL paper
+
+    # The neural architecture to use
+    # - baseline
+    # - DSOM
+    # - SDM
+    parser.add_argument("--architecture", type=str, default=10,
+        help="the type of model architecture used")
+
+    # Whether to use SARSA or Q-learning
+    # - SARSA
+    # - QLEARNING
+    parser.add_argument("--bellman-update", type=str, default=10,
+        help="the type of Bellman equation used: SARSA or QLEARNING")
+    
+    # The optimizer to be used
+    # - ADAM
+    # - RMSPROP
+    # - SGD
+    parser.add_argument("--optimizer", type=str, default=10,
+        help="the optimizer used")
+    
+    # Number of hidden units
+    parser.add_argument("--hidden-size", type=int, default=800,
+        help="the size of the hidden layer")
+    
+
+    # Which epsilon scheduler to use
+    # - LINEAR
+    # - EXPONENTIAL
+    parser.add_argument("--eps-scheduler", type=str, default='LINEAR',
+        help="which scheduler you use")
+    
+    # Epsilon decay rate
+    parser.add_argument("--eps-decay", type=float, default=0.995,
+        help="if using exponential epsilon scheduler, the decay rate")
+    
+    # Number of neurons in sparse layer
+    parser.add_argument("--sparse-dim", type=int, default=32,
+        help="if using sparsity, the number of neurons")
+    
+
     args = parser.parse_args()
     # fmt: on
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
@@ -90,28 +133,71 @@ def make_env(env_id, seed, idx, capture_video, run_name):
     return thunk
 
 
+# TODO: change the core architecture, plus add new ones corresponding to SDM and DSOM
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
     action_dim: int
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
-        x = nn.Dense(120)(x)
-        x = nn.relu(x)
-        x = nn.Dense(84)(x)
+        x = nn.Dense(args.hidden_size)(x)
         x = nn.relu(x)
         x = nn.Dense(self.action_dim)(x)
         return x
+    
+
+class DSOM(nn.Module):
+    action_dim: int
+    obs_dim: int
+
+    def setup(self):
+        self.k = 0.5
+        self.som_codebook_vecs = self.param('som_codebook_vecs', nn.initializers.uniform(), (args.hidden_size, self.obs_dim))
+        self.som_addresses = self.param('som_addresses', nn.initializers.uniform(), (args.hidden_size, self.obs_dim))
+
+        self.dense1 = nn.Dense(args.hidden_size)
+        self.dense2 = nn.Dense(self.action_dim)
+
+    def __call__(self, x: jnp.ndarray):
+        # First layer of NN
+        hidden = self.dense1(x)
+        hidden = nn.relu(hidden)
+
+        # Pass through SOM layer
+        som_outputs = self.som_layer(x)
+
+        # Hadamard product
+        layer2 = hidden * som_outputs
+
+        # Final dense layer
+        output = self.dense2(layer2)
+
+        return output
+
+    def som_layer(self, x: jnp.ndarray):
+        dists = jnp.sqrt(jnp.sum((self.som_codebook_vecs - x)**2, axis=-1))
+        mask = jnp.exp(-dists/self.k)
+        
+        return mask
+    
+    def custom_update(self, grads):
+
+        
+
+        self.apply_gradients(grads=grads)
 
 
 class TrainState(TrainState):
     target_params: flax.core.FrozenDict
 
-
+# TODO: does this need to be an exponential scheduler instead?
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
 
+def exponential_schedule(start_e: float, end_e: float, decay: int, t: int):
+    eps = start_e * (decay ** t)
+    return max(eps, end_e)
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
@@ -157,13 +243,16 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     obs, _ = envs.reset(seed=args.seed)
 
-    q_network = QNetwork(action_dim=envs.single_action_space.n)
+    if args.architecture == 'BASELINE':
+        q_network = QNetwork(action_dim=envs.single_action_space.n)
+    elif args.architecture == 'DSOM':
+        q_network = DSOM(action_dim=envs.single_action_space.n, obs_dim=obs.shape[-1])
 
     q_state = TrainState.create(
         apply_fn=q_network.apply,
         params=q_network.init(q_key, obs),
         target_params=q_network.init(q_key, obs),
-        tx=optax.adam(learning_rate=args.learning_rate),
+        tx=optax.adam(learning_rate=args.learning_rate), # TODO: add other optimizers here
     )
 
     q_network.apply = jax.jit(q_network.apply)
@@ -178,6 +267,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         handle_timeout_termination=False,
     )
 
+    # TODO: this needs to be adjusted to use SARSA as well as QLEARNING
     @jax.jit
     def update(q_state, observations, actions, next_observations, rewards, dones):
         q_next_target = q_network.apply(q_state.target_params, next_observations)  # (batch_size, num_actions)
@@ -190,7 +280,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             return ((q_pred - next_q_value) ** 2).mean(), q_pred
 
         (loss_value, q_pred), grads = jax.value_and_grad(mse_loss, has_aux=True)(q_state.params)
-        q_state = q_state.apply_gradients(grads=grads)
+        q_state.custom_update(grads)
+        #q_state = q_state.apply_gradients(grads=grads)
         return loss_value, q_pred, q_state
 
     start_time = time.time()
@@ -198,8 +289,15 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
+        # TODO: would need to alter this from epsilon-greedy for SARSA implementation 
         # ALGO LOGIC: put action logic here
-        epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
+        if args.eps_scheduler == 'LINEAR':
+            epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
+        elif args.eps_scheduler == 'EXPONENTIAL':
+            epsilon = exponential_schedule(args.start_e, args.end_e, args.eps_decay, global_step)
+        else:
+            raise Exception
+        
         if random.random() < epsilon:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
@@ -234,6 +332,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
+                # TODO: does making the replay buffer size 1 effectively turn it off?
                 data = rb.sample(args.batch_size)
                 # perform a gradient-descent step
                 loss, old_val, q_state = update(
@@ -248,7 +347,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", jax.device_get(loss), global_step)
                     writer.add_scalar("losses/q_values", jax.device_get(old_val).mean(), global_step)
-                    print("SPS:", int(global_step / (time.time() - start_time)))
+                    print("SPS:", int(global_step / (time.time() - start_time))) # steps per second
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
             # update target network
