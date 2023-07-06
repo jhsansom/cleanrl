@@ -16,7 +16,6 @@ from flax.training.train_state import TrainState
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
-
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
@@ -152,6 +151,8 @@ class DSOM(nn.Module):
 
     def setup(self):
         self.k = 0.5
+        self.max_dist = 0
+
         self.som_codebook_vecs = self.param('som_codebook_vecs', nn.initializers.uniform(), (args.hidden_size, self.obs_dim))
         self.som_addresses = self.param('som_addresses', nn.initializers.uniform(), (args.hidden_size, self.obs_dim))
 
@@ -164,7 +165,7 @@ class DSOM(nn.Module):
         hidden = nn.relu(hidden)
 
         # Pass through SOM layer
-        som_outputs = self.som_layer(x)
+        som_outputs = jax.lax.stop_gradient(self.som_layer(x))
 
         # Hadamard product
         layer2 = hidden * som_outputs
@@ -175,16 +176,33 @@ class DSOM(nn.Module):
         return output
 
     def som_layer(self, x: jnp.ndarray):
-        dists = jnp.sqrt(jnp.sum((self.som_codebook_vecs - x)**2, axis=-1))
+
+        # Align both so that the dimensionality is (batch_dim, neuron_dim, obs_dim)
+        x = jnp.expand_dims(x, 1)
+        codebook_vecs_expanded = jnp.expand_dims(self.som_codebook_vecs, 0)
+
+        # Perform the actual calculations
+        dists = jnp.sqrt(jnp.sum((codebook_vecs_expanded - x)**2, axis=-1))
         mask = jnp.exp(-dists/self.k)
         
+        # Mask has shape (batch_dim, neuron_dim)
         return mask
     
-    def custom_update(self, grads):
+def dsom_update(params, obs):
 
-        
+    print(params['params'].keys())
+    cb_vecs = params['params']['som_codebook_vecs']
 
-        self.apply_gradients(grads=grads)
+    # Align both so that the dimensionality is (batch_dim, neuron_dim, obs_dim)
+    obs = jnp.expand_dims(obs, 1)
+    cb_vecs = jnp.expand_dims(cb_vecs, 0)
+
+    dist = np.sum((cb_vecs - obs)**2, axis=-1)
+    print(max_dist)
+    max_dist = max(max(dist), max_dist)
+    print(dist.shape)
+
+    raise Exception
 
 
 class TrainState(TrainState):
@@ -228,6 +246,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
+
+    # TODO: this is a very hacky method of adding this parameter
+    max_dist = 0
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -280,8 +301,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             return ((q_pred - next_q_value) ** 2).mean(), q_pred
 
         (loss_value, q_pred), grads = jax.value_and_grad(mse_loss, has_aux=True)(q_state.params)
-        q_state.custom_update(grads)
-        #q_state = q_state.apply_gradients(grads=grads)
+        if args.architecture == 'DSOM':
+            dsom_update(q_state.params, observations)
+        q_state = q_state.apply_gradients(grads=grads)
         return loss_value, q_pred, q_state
 
     start_time = time.time()
