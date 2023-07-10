@@ -148,10 +148,12 @@ class QNetwork(nn.Module):
 class DSOM(nn.Module):
     action_dim: int
     obs_dim: int
+    max_dist = 0
+    elasticity = 0.5
+    lr = 0.025
 
     def setup(self):
         self.k = 0.5
-        self.max_dist = 0
 
         self.som_codebook_vecs = self.param('som_codebook_vecs', nn.initializers.uniform(), (args.hidden_size, self.obs_dim))
         self.som_addresses = self.param('som_addresses', nn.initializers.uniform(), (args.hidden_size, self.obs_dim))
@@ -188,21 +190,58 @@ class DSOM(nn.Module):
         # Mask has shape (batch_dim, neuron_dim)
         return mask
     
-def dsom_update(params, obs):
+    def dsom_update(self, params, obs, mode='avg'):
 
-    print(params['params'].keys())
-    cb_vecs = params['params']['som_codebook_vecs']
+        cb_vecs = params['params']['som_codebook_vecs'] # (neuron_dim, obs_dim)
+        addresses = params['params']['som_addresses'] # (neuron_dim, obs_dim)
 
-    # Align both so that the dimensionality is (batch_dim, neuron_dim, obs_dim)
-    obs = jnp.expand_dims(obs, 1)
-    cb_vecs = jnp.expand_dims(cb_vecs, 0)
+        # Align both arrays
+        obs = jnp.expand_dims(obs, 1) # (batch_dim, 1, obs_dim)
+        cb_vecs = jnp.expand_dims(cb_vecs, 0) # (1, neuron_dim, obs_dim)
 
-    dist = np.sum((cb_vecs - obs)**2, axis=-1)
-    print(max_dist)
-    max_dist = max(max(dist), max_dist)
-    print(dist.shape)
+        # Calculate euclidean norm distances
+        diff = (cb_vecs - obs) # (batch_dim, neuron_dim, obs_dim)
+        dist = jnp.sum(diff**2, axis=-1) # (batch_dim, neuron_dim)
 
-    raise Exception
+        # Calculate winner for each batch sample 
+        winner_idx = jnp.argmin(dist, axis=1) # (batch_dim)
+
+        # Recalculate maximum for use in normalized distance metric
+        self.max_dist = jnp.max(jnp.array([jnp.max(jnp.ravel(dist)), self.max_dist])) # scalar
+
+        # Calculate normalized euclidean norm distances
+        dist_normed = dist / self.max_dist # (batch_dim, neuron_dim)
+        
+        # Calculate h numerator
+        winner_addresses = addresses[winner_idx, :] # (batch_dim, obs_dim)
+        winner_addresses = jnp.expand_dims(winner_addresses, 1) # (batch_dim, 1, obs_dim)
+        addresses = jnp.expand_dims(addresses, 0) # (1, neuron_dim, obs_dim)
+        numerators = jnp.sum((addresses - winner_addresses)**2, axis=-1) # (batch_dim, neuron_dim)
+
+        # Calculate h denominator
+        winner_cb_vecs = cb_vecs[winner_idx, :] # (batch_dim, obs_dim)
+        denominators = (1/self.elasticity)**2 * jnp.sum((obs - winner_cb_vecs)**2 / self.max_dist**2, axis=-1) # (batch_dim, neuron_dim)
+        
+        # Calculate h overall
+        h = jnp.exp(numerators / denominators) # (batch_dim, obs_dim)
+        
+        # Calculate change in weights
+        dist_normed = jnp.expand_dims(dist_normed, -1) # (batch_dim, neuron_dim, 1)
+        h = jnp.expand_dims(h, -1) # (batch_dim, neuron_dim, 1)
+        delta_w_batch = self.lr * dist_normed * h * diff # (batch_dim, neuron_dim, obs_dim)
+
+        # Collapse batch dimension
+        if mode == 'avg':
+            delta_w = jnp.average(delta_w_batch, axis=0) # (neuron_dim, obs_dim)
+        elif mode == 'sum':
+            delta_w = jnp.average(delta_w_batch, axis=0) # (neuron_dim, obs_dim)
+        else:
+            raise Exception('Invalid update mode')
+
+        # Apply update vector
+        new_cb_vecs = cb_vecs.squeeze() + delta_w
+
+        return new_cb_vecs
 
 
 class TrainState(TrainState):
@@ -247,9 +286,6 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # TODO: this is a very hacky method of adding this parameter
-    max_dist = 0
-
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -271,8 +307,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     q_state = TrainState.create(
         apply_fn=q_network.apply,
-        params=q_network.init(q_key, obs),
-        target_params=q_network.init(q_key, obs),
+        params=q_network.init(q_key, obs).unfreeze(),
+        target_params=q_network.init(q_key, obs).unfreeze(),
         tx=optax.adam(learning_rate=args.learning_rate), # TODO: add other optimizers here
     )
 
@@ -302,7 +338,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         (loss_value, q_pred), grads = jax.value_and_grad(mse_loss, has_aux=True)(q_state.params)
         if args.architecture == 'DSOM':
-            dsom_update(q_state.params, observations)
+            q_state.params['params']['som_codebook_vecs'] = q_network.dsom_update(q_state.params, observations)
         q_state = q_state.apply_gradients(grads=grads)
         return loss_value, q_pred, q_state
 
