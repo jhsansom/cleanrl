@@ -108,7 +108,7 @@ def parse_args():
         help="if using exponential epsilon scheduler, the decay rate")
     
     # Number of neurons in sparse layer
-    parser.add_argument("--sparse-dim", type=int, default=32,
+    parser.add_argument("--sparse-dim", type=int, default=128,
         help="if using sparsity, the number of neurons")
     
     # Learning rate for DSOM updates
@@ -278,6 +278,69 @@ class DSOM(nn.Module):
 
         return new_cb_vecs
     
+class SDM(nn.Module):
+    action_dim: int
+    obs_dim: int
+    max_dist = 0
+    elasticity = 0.5
+    lr = 0.025
+
+    def setup(self):
+        self.k = 0.995
+
+        # hidden_size : size of keys and values
+        # sparse_dim : number of neurons
+
+        self.sdm_values = self.param('sdm_values', nn.initializers.normal(0.5), (args.sparse_dim, args.hidden_size))
+        self.sdm_keys = self.param('sdm_keys', nn.initializers.uniform(1.0), (args.hidden_size, args.sparse_dim))
+
+        # Normalize and clip positive
+        self.sdm_keys = jnp.maximum(self.sdm_keys, 0)
+        self.sdm_keys = self.sdm_keys / jnp.linalg.norm(self.sdm_keys, axis=0)
+        self.sdm_values = jnp.maximum(self.sdm_values, 0)
+
+        self.dense1 = nn.Dense(args.hidden_size)
+        self.dense2 = nn.Dense(self.action_dim)
+
+    def __call__(self, x: jnp.ndarray):
+        # First layer of NN
+        hidden = self.dense1(x)
+        hidden = nn.relu(hidden)
+
+        # Pass through SDM layer
+        hidden2 = self.sdm_layer(hidden)
+
+        # Final dense layer
+        output = self.dense2(hidden2)
+
+        return output
+
+    def sdm_layer(self, x: jnp.ndarray):
+
+        # Normalization steps
+        x = x / jnp.linalg.norm(x, axis=-1)
+        
+        # Get activations
+        activations = jnp.matmul(x, self.sdm_keys) # (batch_dim, sparse_dim)
+
+        # Get the top k
+        k_abs = math.ceil(self.k*args.hidden_size) + 1
+        sorted_activations = jnp.sort(activations, axis=-1)
+        min_activation = jnp.squeeze(sorted_activations[:, -k_abs])
+        activations = jnp.maximum(activations - min_activation, 0) # (batch_dim, sparse_dim)
+
+        # Get layer output
+        return jnp.matmul(activations, self.sdm_values)
+    
+    def sdm_update(self, params):
+        sdm_keys = params['params']['sdm_keys']
+        sdm_values = params['params']['sdm_values']
+        sdm_keys = jnp.maximum(sdm_keys, 0)
+        sdm_keys = sdm_keys / jnp.linalg.norm(sdm_keys, axis=0)
+        sdm_values = jnp.maximum(sdm_values, 0)
+
+        return (sdm_keys, sdm_values)
+
 
 def plot_codebook_vecs(vecs, num, obs):
     x = vecs[:,0]
@@ -303,7 +366,7 @@ def exponential_schedule(start_e: float, end_e: float, decay: int, t: int):
     eps = start_e * (decay ** t)
     return max(eps, end_e)
 
-if __name__ == "__main__":
+def main(args):
     import stable_baselines3 as sb3
 
     if sb3.__version__ < "2.0":
@@ -313,7 +376,7 @@ if __name__ == "__main__":
 poetry run pip install "stable_baselines3==2.0.0a1"
 """
         )
-    args = parse_args()
+    
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -353,6 +416,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         q_network = DSOM(action_dim=envs.single_action_space.n, obs_dim=obs.shape[-1])
         q_network.lr = args.dsom_lr
         q_network.elasticity = args.elasticity
+    elif args.architecture == 'SDM':
+        q_network = SDM(action_dim=envs.single_action_space.n, obs_dim=obs.shape[-1])
 
     q_state = TrainState.create(
         apply_fn=q_network.apply,
@@ -394,6 +459,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         (loss_value, q_pred), grads = jax.value_and_grad(mse_loss, has_aux=True)(q_state.params)
         q_state = q_state.apply_gradients(grads=grads)
+
+        if args.architecture == 'SDM':
+            (sdm_keys, sdm_values) = q_network.sdm_update(q_state.params)
+            q_state.params['params']['sdm_keys'] = sdm_keys
+            q_state.params['params']['sdm_values'] = sdm_values
+
         return loss_value, q_pred, q_state
 
     start_time = time.time()
@@ -450,6 +521,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 # TODO: does making the replay buffer size 1 effectively turn it off?
                 data = rb.sample(args.batch_size)
                 # perform a gradient-descent step
+                q_network.k = epsilon
                 loss, old_val, q_state = update(
                     q_state,
                     data.observations.numpy(),
@@ -506,3 +578,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     envs.close()
     writer.close()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)
